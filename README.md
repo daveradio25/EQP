@@ -220,7 +220,7 @@ EQP is a hobby project. Know what you are getting:
 - **The EQ is a simple graphic EQ.** Ten fixed octave bands are a blunt tool
   compared with a parametric EQ, and any EQ setting other than flat means
   playback is, by design, no longer bit-perfect.
-- **Only stereo FLAC and WAV have been used in practice.** AIFF and Ogg files
+- **Stereo FLAC, WAV and AIFF have been used in practice.** Ogg files
   should work, since the same decoder reads them, but are untested. DSD is
   not supported, and multichannel files are untested.
 - **Starts from a console window**, because it asks for the output device
