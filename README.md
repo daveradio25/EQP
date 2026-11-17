@@ -15,6 +15,10 @@ is doing to the signal on the way: nothing at all, or exactly what.
 It also has a 10-band graphic EQ with named presets, for when you want to
 change the sound on purpose.
 
+| EQ flat: the DAC gets the file's samples unchanged | EQ in use: the readout says so |
+|---|---|
+| ![EQP with a flat EQ, showing BIT-PERFECT](Images/screenshot_bit_perfect.png) | ![EQP with an EQ preset loaded, showing EQ on](Images/screenshot_eq_on.png) |
+
 ## Why this exists
 
 Ordinary Windows playback goes through the system mixer. The mixer converts
@@ -216,7 +220,7 @@ EQP is a hobby project. Know what you are getting:
 - **The EQ is a simple graphic EQ.** Ten fixed octave bands are a blunt tool
   compared with a parametric EQ, and any EQ setting other than flat means
   playback is, by design, no longer bit-perfect.
-- **Only stereo FLAC has been used in practice.** WAV, AIFF and Ogg files
+- **Only stereo FLAC and WAV have been used in practice.** AIFF and Ogg files
   should work, since the same decoder reads them, but are untested. DSD is
   not supported, and multichannel files are untested.
 - **Starts from a console window**, because it asks for the output device
