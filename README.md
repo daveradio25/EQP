@@ -170,7 +170,7 @@ and while EQP is playing, other applications cannot use that output.
 - **DAC bit depth** sets what EQP sends to this DAC (see above). It is saved
   per device.
 - **Sliders** change the EQ while the music plays. Moves are heard after
-  about a fifth of a second.
+  a little under a second, because audio is prepared ahead of the DAC.
 - **Preamp**: if the status line shows `CLIPPING`, lower the preamp by roughly
   the size of your largest boost.
 - **Presets** menu loads a saved EQ. **Save as...** stores the current
@@ -208,12 +208,10 @@ EQP is a hobby project. Know what you are getting:
   (24-bit output, rates above 48 kHz, rate fallback) have only been tested
   against simulated devices, not real high-resolution hardware. Reports are
   welcome.
-- **Python is not a real-time audio language.** EQP keeps a 0.2-second buffer
-  to cope, but a heavily loaded PC can still cause dropouts. The status line
-  counts them.
-- **Whole tracks are loaded into memory**, about 20 MB per minute at CD
-  quality and several times that for high-resolution files. Long hi-res
-  tracks take a moment to load, longer if they must be resampled.
+- **Python is not a real-time audio language.** EQP prepares audio about
+  half a second ahead and keeps a further 0.2 seconds in the DAC driver's
+  buffer to cope, but a heavily loaded PC can still cause dropouts. The
+  status line counts them.
 - **Not gapless.** There is a short gap between tracks.
 - **A bare-bones player.** No seek bar, no music library, no tags or album
   art, no volume control, no shuffle or repeat.
@@ -232,11 +230,17 @@ EQP is a hobby project. Know what you are getting:
   probably using the DAC; close it. Also check that "Allow applications to
   take exclusive control of this device" is ticked in the old Sound control
   panel → Playback → your DAC → Properties → Advanced.
-- **Sound slows down and crackles, pitch unchanged.** The PC is not keeping
-  up. If the `dropouts` number in the status line is climbing, close other
-  programs or raise `BUFFER_SECONDS` near the top of `eqp.py` to `0.4`. If
-  the counter stays at zero, suspect the USB connection: plug the DAC
-  directly into a rear motherboard port rather than a hub.
+- **Clicks, crackles, or sound that slows down with the pitch unchanged.**
+  Look at the `dropouts` number in the status line.
+  - *Climbing:* the PC is not keeping up. Close other programs, or raise
+    `PREBUFFER_SECONDS` and `BUFFER_SECONDS` near the top of `eqp.py` (try
+    `2.0` and `0.4`).
+  - *Zero or absent:* EQP is delivering audio on time, so look downstream.
+    Plug the DAC directly into a rear motherboard port rather than a hub,
+    try another cable, and check the DAC driver's own control panel for a
+    buffer or "streaming mode" setting; high sample rates often need a
+    larger one. Playing the same file in another exclusive-mode player
+    tells you whether the problem is EQP or the DAC connection.
 - **Typing `python` opens the Microsoft Store.** Use `py` instead, as in the
   commands above.
 - **The DAC is not in the list.** EQP only shows outputs Windows currently
@@ -247,7 +251,10 @@ EQP is a hobby project. Know what you are getting:
 ## How it works
 
 - Files are decoded with [soundfile](https://github.com/bastibe/python-soundfile)
-  (libsndfile).
+  (libsndfile). They are streamed from disk a quarter of a second at a time,
+  so memory use stays small however large the file.
+- A background thread prepares audio ahead of the DAC; the time-critical
+  part that feeds the DAC only copies finished blocks.
 - Audio is sent with [sounddevice](https://github.com/spatialaudio/python-sounddevice)
   (PortAudio) using WASAPI exclusive mode.
 - When nothing needs changing, samples are passed through as integers with no
@@ -255,8 +262,8 @@ EQP is a hobby project. Know what you are getting:
 - Otherwise the signal goes through ten peaking filters
   ([SciPy](https://scipy.org/)), the preamp, and TPDF dither before being
   rounded to the output bit depth.
-- If the DAC refuses the file's sample rate, the track is converted with a
-  polyphase resampler.
+- If the DAC refuses the file's sample rate, the track is converted on the
+  fly with a polyphase resampler.
 - The window is plain Tkinter, which ships with Python.
 
 ## Files

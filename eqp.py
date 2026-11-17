@@ -10,9 +10,11 @@ Features: IN/OUT format readout with a bit-perfect indicator, automatic
 sample-rate matching, per-DAC bit-depth setting, a live 10-band graphic EQ
 with named presets, and a simple playlist.  See README.md.
 """
+import collections
 import json
 import os
 import sys
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog
 import numpy as np
@@ -24,7 +26,10 @@ from scipy.signal import resample_poly, sosfilt
 BANDS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]  # Hz
 Q = 1.41          # one-octave-wide bands
 RANGE_DB = 12     # each slider goes +/- this much
-BUFFER_SECONDS = 0.2   # audio held ready for the DAC; larger = fewer dropouts
+BUFFER_SECONDS = 0.2      # audio held in the DAC driver's buffer
+PREBUFFER_SECONDS = 0.5   # extra audio prepared ahead of the DAC
+# Raising either makes playback more tolerant of a busy PC, but slider
+# moves take that much longer to be heard.
 
 # Dark theme colours
 BG, PANEL, TROUGH = "#1e1e1e", "#2a2a2a", "#3a3a3a"
@@ -110,58 +115,111 @@ def describe(sr, bits):
 
 
 class Player:
+    """Streams a file to the DAC.
+
+    A background thread reads the file a quarter of a second at a time,
+    applies whatever processing is needed and queues the finished blocks.
+    The audio callback only copies queued blocks to the DAC, so it stays
+    fast however large the file or high the sample rate.
+    """
+
     def __init__(self, device, bits=16):
         self.device = device
-        self.in_sr = self.in_bits = None
-        self.preamp_db = 0.0
-        self.exact = False
-        self.set_format(bits)
         self.stream = None
-        self.data = None
+        self.file = None
+        self.thread = None
+        self.lock = threading.Lock()
+        self.queue = collections.deque()    # finished blocks waiting for the DAC
+        self.queued = 0                     # frames in the queue
         self.gains = [0.0] * len(BANDS)
         self.preamp = 1.0
-        self.pos = 0
+        self.preamp_db = 0.0
+        self.in_sr = self.in_bits = None
+        self.sr = self.total = self.pos = 0
+        self.exact = False
         self.paused = False
         self.clipped = False
         self.finished = False
         self.dropouts = 0       # times the DAC ran out of audio
         self.rng = np.random.default_rng()
+        self.set_format(bits)
 
+    # ---------- starting and stopping ----------
     def load(self, path):
         """Stop whatever is playing and start this file from the top."""
         self.close()
-        in_bits = FILE_BITS.get(sf.info(path).subtype)   # None if not plain PCM
-        data, in_sr = sf.read(path, dtype="float32", always_2d=True)
-        if data.shape[1] == 1:                      # mono -> both ears
-            data = np.repeat(data, 2, axis=1)
-        self.ch = data.shape[1]
-
-        # Use the file's own sample rate if the DAC accepts it; otherwise
-        # step down to the nearest rate it does accept and convert.
-        first_error = None
-        for sr in rate_candidates(in_sr):
-            self.sr = sr
-            try:
-                stream = self.open_stream(BUFFER_SECONDS)
-                break
-            except Exception as e:
-                first_error = first_error or e
-        else:
-            raise first_error
-        if sr != in_sr:
-            g = gcd(sr, in_sr)
-            data = resample_poly(data, sr // g, in_sr // g, axis=0).astype("float32")
-
-        self.data, self.in_sr, self.in_bits = data, in_sr, in_bits
-        self.freqs = [f for f in BANDS if f < 0.45 * sr]
+        f = sf.SoundFile(path)
+        try:
+            self.ch = max(2, f.channels)            # mono is sent to both ears
+            # Use the file's own sample rate if the DAC accepts it; otherwise
+            # step down to the nearest rate it does accept and convert.
+            first_error = None
+            for sr in rate_candidates(f.samplerate):
+                self.sr = sr
+                try:
+                    stream = self.open_stream(BUFFER_SECONDS)
+                    break
+                except Exception as e:
+                    first_error = first_error or e
+            else:
+                raise first_error
+        except Exception:
+            f.close()
+            raise
+        self.file = f
+        self.in_sr, self.in_bits = f.samplerate, FILE_BITS.get(f.subtype)
+        g = gcd(sr, self.in_sr)
+        self.up, self.down = sr // g, self.in_sr // g     # both 1 if no resampling
+        self.total = -(-f.frames * self.up // self.down)  # length at output rate
+        self.freqs = [b for b in BANDS if b < 0.45 * sr]
         self.sos = build_sos(self.gains, self.freqs, sr)
         self.zi = np.zeros((len(self.freqs), 2, self.ch))
-        self.pos = 0
-        self.paused = self.finished = False
+        self.pos = self.gen_pos = 0
+        self.eof = self.paused = self.finished = False
         self.refresh_exact()
-        self.stream = stream
+        self.start(stream)
+
+    def start(self, stream=None):
+        """Fill the queue, then start the reader thread and the DAC stream."""
+        while self.queued < PREBUFFER_SECONDS * self.sr and not self.eof:
+            self.produce()
+        self.stream = stream or self.open_stream(BUFFER_SECONDS)
+        self.stop_flag = threading.Event()
+        self.thread = threading.Thread(target=self.run, args=(self.stop_flag,),
+                                       daemon=True)
+        self.thread.start()
         self.stream.start()
 
+    def halt(self):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+        if self.thread is not None:
+            self.stop_flag.set()
+            self.thread.join()
+            self.thread = None
+
+    def close(self):
+        self.halt()
+        if self.file is not None:
+            self.file.close()
+            self.file = None
+        self.queue.clear()
+        self.queued = 0
+
+    def open_stream(self, latency):
+        try:
+            return sd.OutputStream(
+                samplerate=self.sr, device=self.device, channels=self.ch,
+                dtype=self.dtype, latency=latency, callback=self.callback,
+                dither_off=True,    # the audio library must not add noise
+                extra_settings=sd.WasapiSettings(exclusive=True))
+        except Exception:
+            if latency == "high":
+                raise
+            return self.open_stream("high")   # driver refused the big buffer
+
+    # ---------- settings ----------
     def set_format(self, bits):
         """Bit depth sent to the DAC. 24-bit travels in a 32-bit container."""
         self.out_bits = bits
@@ -171,13 +229,26 @@ class Player:
 
     def set_bits(self, bits):
         """Change the output bit depth, carrying on from the same position."""
-        playing = self.stream is not None
-        self.close()
+        playing = self.file is not None
+        self.halt()
         self.set_format(bits)
         if playing:
+            # Queued audio is in the old format: discard it and re-read
+            self.queue.clear()
+            self.queued = 0
+            self.pos -= self.pos % self.up
+            self.gen_pos = self.pos
+            self.eof = False
             self.refresh_exact()
-            self.stream = self.open_stream(BUFFER_SECONDS)
-            self.stream.start()
+            self.start()
+
+    def set_eq(self, gains_db, preamp_db):
+        self.gains = list(gains_db)
+        self.preamp_db = preamp_db
+        self.preamp = 10 ** (preamp_db / 20)
+        if self.file is not None:
+            self.sos = build_sos(self.gains, self.freqs, self.sr)
+            self.refresh_exact()
 
     def refresh_exact(self):
         """True when the DAC gets the file's samples completely untouched."""
@@ -201,55 +272,93 @@ class Player:
             notes.append("EQ on")
         return ", ".join(notes)
 
-    def open_stream(self, latency):
-        try:
-            return sd.OutputStream(
-                samplerate=self.sr, device=self.device, channels=self.ch,
-                dtype=self.dtype, latency=latency, callback=self.callback,
-                dither_off=True,    # the audio library must not add noise
-                extra_settings=sd.WasapiSettings(exclusive=True))
-        except Exception:
-            if latency == "high":
-                raise
-            return self.open_stream("high")   # driver refused the big buffer
+    # ---------- reader thread ----------
+    def run(self, stop):
+        while not stop.is_set():
+            if self.eof or self.queued >= PREBUFFER_SECONDS * self.sr:
+                stop.wait(0.02)
+            else:
+                self.produce()
 
-    def close(self):
-        if self.stream is not None:
-            self.stream.close()
-            self.stream = None
+    def produce(self):
+        """Read, process and queue the next quarter-second of the track."""
+        block = self.render(self.read())
+        with self.lock:
+            if len(block):
+                self.queue.append(block)
+                self.queued += len(block)
+            self.eof = self.gen_pos >= self.total
 
-    def set_eq(self, gains_db, preamp_db):
-        self.gains = list(gains_db)
-        self.preamp_db = preamp_db
-        self.preamp = 10 ** (preamp_db / 20)
-        if self.stream is not None:
-            self.sos = build_sos(self.gains, self.freqs, self.sr)
-            self.refresh_exact()
+    def read(self):
+        """Next slice of the track at the output rate: the file's own integer
+        samples, or floating point if the sample rate is being converted."""
+        f, up, down = self.file, self.up, self.down
+        if up == down:
+            if f.tell() != self.gen_pos:
+                f.seek(self.gen_pos)
+            x = f.read(self.sr // 4, dtype="int32", always_2d=True)
+        else:
+            # Convert in slices, with a little extra audio either side so the
+            # joins between slices are seamless.
+            ctx = down * -(-512 // down)
+            step = down * max(1, self.in_sr // 4 // down)
+            begin = self.gen_pos // up * down
+            left = min(ctx, begin)
+            f.seek(begin - left)
+            x = f.read(left + step + ctx, dtype="float64", always_2d=True)
+            x = resample_poly(x, up, down, axis=0)
+            skip = left * up // down
+            x = x[skip:skip + min(step * up // down, self.total - self.gen_pos)]
+        if len(x) == 0:
+            self.total = self.gen_pos       # file was shorter than it claimed
+        if x.shape[1] == 1:
+            x = np.repeat(x, 2, axis=1)
+        self.gen_pos += len(x)
+        return x
 
+    def render(self, x):
+        """Turn a slice of the track into the samples sent to the DAC."""
+        if self.exact:
+            # Nothing to change: the file's own samples, as integers
+            return (x >> 16).astype(np.int16) if self.out_bits == 16 else x
+        if x.dtype != np.float64:
+            x = x / 2147483648.0
+        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
+        y *= self.preamp
+        if np.abs(y).max(initial=0) > 1.0:
+            self.clipped = True
+        # TPDF dither before rounding to the output bit depth
+        y = y * self.scale + self.rng.random(y.shape) - self.rng.random(y.shape)
+        y = np.clip(np.round(y), -self.scale, self.scale - 1)
+        return (y * self.shift).astype(self.dtype)
+
+    # ---------- audio callback ----------
     def callback(self, out, frames, time, status):
         if status:
             self.dropouts += 1
         if self.paused:
             out[:] = 0
             return
-        chunk = self.data[self.pos:self.pos + frames]
-        self.pos += len(chunk)
-        if self.exact:
-            # Nothing to change: hand the file's samples over as they are
-            y = chunk.astype(np.float64) * self.scale
-        else:
-            y, self.zi = sosfilt(self.sos, chunk, axis=0, zi=self.zi)
-            y *= self.preamp
-            if np.abs(y).max(initial=0) > 1.0:
-                self.clipped = True
-            # TPDF dither before rounding to the output bit depth
-            y = y * self.scale + self.rng.random(y.shape) - self.rng.random(y.shape)
-        y = np.clip(np.round(y), -self.scale, self.scale - 1)
-        out[:len(chunk)] = y * self.shift
-        if len(chunk) < frames:
-            out[len(chunk):] = 0
-            self.finished = True
-            raise sd.CallbackStop
+        done = 0
+        with self.lock:
+            while done < frames and self.queue:
+                block = self.queue[0]
+                n = min(frames - done, len(block))
+                out[done:done + n] = block[:n]
+                if n == len(block):
+                    self.queue.popleft()
+                else:
+                    self.queue[0] = block[n:]
+                done += n
+            self.queued -= done
+            ended = self.eof and not self.queue
+        self.pos += done
+        if done < frames:
+            out[done:] = 0
+            if ended:
+                self.finished = True
+                raise sd.CallbackStop
+            self.dropouts += 1          # reader thread fell behind
 
 
 def choose_device(store):
@@ -595,7 +704,7 @@ def main():
         elif p.stream is None:
             text = "Pick files to play"
         else:
-            secs, total = p.pos // p.sr, len(p.data) // p.sr
+            secs, total = p.pos // p.sr, p.total // p.sr
             text = f"{secs // 60}:{secs % 60:02d} / {total // 60}:{total % 60:02d}"
             if p.dropouts:
                 text += f"   dropouts: {p.dropouts}"
