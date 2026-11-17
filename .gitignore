@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Your own presets and per-DAC settings, created when EQP runs
+eqp_presets.json
+flaceq_presets.json
